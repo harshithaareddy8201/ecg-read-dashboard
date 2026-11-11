@@ -1,0 +1,816 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ECG Report Explainer</title>
+<meta name="description" content="An ECG strip explained in plain words: a prototype tested on 100,733 heartbeats from 44 patients.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap">
+<style>
+  /* Design tokens: light first, dark when the reader's system asks for it */
+  :root {
+    color-scheme: light;
+    --color-bg: #fbfbfa; --color-panel: #ffffff; --color-fg: #1b1d21; --color-fg-muted: #5c6370; --color-border-line: #e3e4e8;
+    --color-ok: #1a7f4b; --color-warn: #b26a00; --color-bad: #c2362f;
+    --accent: #2f5bd3;
+    --cds-chart-muted: #9aa0aa; --cds-chart-grid: #ececef; --cds-chart-axis: #c4c7ce; --cds-chart-reference: #a7abb4;
+    --cds-text-secondary: #5c6370; --cds-surface-popover: #ffffff; --cds-border: #d9dbe0; --cds-shadow-popover: 0 4px 16px rgba(20, 22, 30, .12);
+    --font-anthropic-sans: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-anthropic-serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+    --cds-font-size-caption: 12px; --cds-font-size-body: 15px; --cds-font-size-heading: 18px; --cds-font-size-title: 34px;
+    --cds-font-weight-medium: 600;
+    --cds-gap-xs: 4px; --cds-gap-sm: 8px; --cds-gap-md: 16px; --cds-gap-lg: 20px; --cds-gap-xl: 32px;
+    --cds-pad-sm: 8px; --cds-pad-md: 14px; --cds-pad-lg: 20px; --cds-radius: 10px;
+    --cds-dur-slow: 400ms; --cds-ease-out: cubic-bezier(.2, .7, .2, 1);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --color-bg: #111317; --color-panel: #181b20; --color-fg: #e9eaee; --color-fg-muted: #a1a7b3; --color-border-line: #2b2f37;
+      --color-ok: #4cc38a; --color-warn: #f0a742; --color-bad: #f2716a;
+      --accent: #7aa2ff;
+      --cds-chart-muted: #6d737e; --cds-chart-grid: #23272e; --cds-chart-axis: #3b404a; --cds-chart-reference: #5b616c;
+      --cds-text-secondary: #a1a7b3; --cds-surface-popover: #1f232a; --cds-border: #353a44; --cds-shadow-popover: 0 4px 16px rgba(0, 0, 0, .5);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { background: var(--color-bg); color: var(--color-fg); font: var(--cds-font-size-body)/1.5 var(--font-anthropic-sans); }
+  #dash-root { max-width: 1120px; margin: 0 auto; padding-block: 40px 64px; padding-left: max(20px, env(safe-area-inset-left, 0px)); padding-right: max(20px, env(safe-area-inset-right, 0px)); }
+  a:focus-visible, button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .dash-select { font: inherit; font-size: var(--cds-font-size-caption); color: var(--color-fg); background-color: var(--color-panel); border: 1px solid var(--color-border-line); border-radius: 8px; padding: 6px 10px; max-width: 100%; }
+  @media (max-width: 600px) { :root { --cds-font-size-title: 27px; } }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+<script>
+/* A small stand-in for the dashboard runtime: loads the CSV files in out/csv/
+   and redraws every chart when data, the chosen settings or the width change. */
+(function () {
+  const SOURCES = {
+    recordings: 'out/csv/recordings.csv', hr_trend: 'out/csv/hr_trend.csv', beats: 'out/csv/beats.csv',
+    strip_index: 'out/csv/strip_index.csv', strips: 'out/csv/strips.csv', accuracy_by_class: 'out/csv/accuracy_by_class.csv',
+    detection: 'out/csv/detection.csv', threshold_sweep: 'out/csv/threshold_sweep.csv', all_records: 'out/csv/all_records.csv',
+    method_comparison: 'out/csv/method_comparison.csv', benchmark_totals: 'out/csv/benchmark_totals.csv'
+  };
+  const store = {}, draws = {}, listeners = [];
+  let params = Object.assign({}, {record: "100", strip: "100-1", view: "patient", lang: "en", early_i: 2, shape_i: 4}), ready = false;
+  const safe = (fn, el) => { try { fn(el); } catch (e) { console.error(e); } };
+  const runDraw = (name) => document.querySelectorAll('[data-draw="' + name + '"]').forEach((el) => safe(draws[name], el));
+  const runAll = () => { if (!ready) return; listeners.forEach((fn) => safe(fn)); Object.keys(draws).forEach(runDraw); };
+  const load = (id) => {
+    if (store[id]) return;
+    if (!SOURCES[id]) { store[id] = {status: 'missing', data: []}; return; }
+    store[id] = {status: 'loading', data: []};
+    d3.csv(SOURCES[id]).then((rows) => { store[id] = {status: 'ok', data: rows}; runAll(); })
+      .catch(() => { store[id] = {status: 'error', data: []}; runAll(); });
+  };
+  window.dash = {
+    data(id) { load(id); return store[id]; },
+    onData(fn) { listeners.push(fn); if (ready) safe(fn); },
+    draw(name, fn) { if (typeof fn === 'function') draws[name] = fn; else if (draws[name]) runDraw(name); },
+    params() { return params; },
+    setParams(p) { Object.assign(params, p); runAll(); },
+    resetParams() { params = Object.assign({}, {record: "100", strip: "100-1", view: "patient", lang: "en", early_i: 2, shape_i: 4}); runAll(); },
+    setLink() {},
+    colors: ['var(--accent)', '#e0703a', '#2a9d8f', '#8e5bd1', '#d64f8a', '#6b8e23', '#c19a00', '#4a6fa5']
+  };
+  window.__dashBoot = () => {
+    ready = true; Object.keys(SOURCES).forEach(load); runAll();
+    let w = window.innerWidth, t;
+    window.addEventListener('resize', () => { if (window.innerWidth === w) return; w = window.innerWidth; clearTimeout(t); t = setTimeout(runAll, 150); });
+  };
+})();
+</script>
+</head>
+<body>
+<main id="dash-root">
+
+<style>
+  .ecg { display: flex; flex-direction: column; gap: var(--cds-gap-xl); max-width: 980px; }
+  .ecg-head { display: flex; flex-direction: column; gap: var(--cds-gap-sm); }
+  .ecg-eyebrow { margin: 0; font-size: var(--cds-font-size-caption); letter-spacing: .06em; text-transform: uppercase; color: var(--color-fg-muted); }
+  .ecg-title { margin: 0; font-family: var(--font-anthropic-serif); font-weight: 400; font-size: var(--cds-font-size-title); line-height: 1.15; text-wrap: balance; }
+  .ecg-lede { margin: 0; max-width: 68ch; color: var(--color-fg-muted); line-height: 1.55; }
+  .ecg-lede a, .ecg-foot a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+  .ecg-picker { display: flex; flex-wrap: wrap; gap: var(--cds-gap-sm); align-items: center; }
+  .ecg-picker-label { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); margin-right: var(--cds-gap-xs); }
+  .ecg-tab { font: inherit; cursor: pointer; padding: 6px 14px; border-radius: 999px; border: 1px solid var(--color-border-line); background: var(--color-panel); color: var(--color-fg); }
+  .ecg-tab[aria-pressed="true"] { background: var(--color-fg); color: var(--color-bg); border-color: var(--color-fg); }
+  .ecg-tab:focus-visible { outline: 2px solid var(--color-fg); outline-offset: 2px; }
+  .ecg-recnote { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+  .ecg-verdict { display: grid; grid-template-columns: auto 1fr; gap: var(--cds-gap-md); align-items: start; padding: var(--cds-pad-lg); border-radius: var(--cds-radius); border: 1px solid var(--color-border-line); background: var(--color-panel); border-left-width: 4px; }
+  .ecg-verdict.is-green { border-left-color: var(--color-ok); }
+  .ecg-verdict.is-amber { border-left-color: var(--color-warn); }
+  .ecg-verdict.is-red { border-left-color: var(--color-bad); }
+  .ecg-pill { display: inline-block; padding: 4px 12px; border-radius: 999px; font-weight: var(--cds-font-weight-medium); white-space: nowrap; border: 1px solid currentColor; }
+  .ecg-pill[hidden] { display: none; }
+  .ecg-pill[data-v="green"] { color: var(--color-ok); }
+  .ecg-pill[data-v="amber"] { color: var(--color-warn); }
+  .ecg-pill[data-v="red"] { color: var(--color-bad); }
+  .ecg-advice { margin: 0; font-size: var(--cds-font-size-heading); line-height: 1.4; min-width: 0; }
+  .ecg-disclaimer { margin: var(--cds-gap-xs) 0 0; font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+  .ecg-tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--cds-gap-md); }
+  @media (max-width: 640px) { .ecg-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .ecg-tile { padding: var(--cds-pad-md) var(--cds-pad-lg); border-radius: var(--cds-radius); border: 1px solid var(--color-border-line); background: var(--color-panel); display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .ecg-tile-label { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+  .ecg-tile-value { font-family: var(--font-anthropic-serif); font-weight: 400; font-size: clamp(24px, 4vw, 32px); font-variant-numeric: tabular-nums; line-height: 1.1; overflow-wrap: anywhere; }
+  .ecg-unit { font-family: var(--font-anthropic-sans); font-size: var(--cds-font-size-body); color: var(--color-fg-muted); margin-left: 2px; }
+  .ecg-tile-note { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+  .ecg-section { display: flex; flex-direction: column; gap: var(--cds-gap-sm); min-width: 0; }
+  .ecg-h2 { margin: 0; font-size: var(--cds-font-size-heading); font-weight: var(--cds-font-weight-medium); text-wrap: balance; }
+  .ecg-sub { margin: 0; color: var(--color-fg-muted); max-width: 70ch; line-height: 1.5; }
+  .ecg-row { display: flex; flex-wrap: wrap; gap: var(--cds-gap-md); align-items: center; justify-content: space-between; }
+  .ecg-legend { display: flex; flex-wrap: wrap; gap: var(--cds-gap-md); font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+  .ecg-key { display: inline-flex; align-items: center; gap: 6px; }
+  .ecg-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .ecg-dot.n { background: var(--cds-chart-muted); }
+  .ecg-dot.e { background: var(--color-warn); }
+  .ecg-dot.u { background: var(--color-bad); }
+  .ecg-chart { position: relative; min-height: 240px; min-width: 0; }
+  .ecg-chart svg { display: block; width: 100%; overflow: visible; }
+  .ecg-chart .tick text { fill: var(--cds-text-secondary); font-size: var(--cds-font-size-caption); }
+  .ecg-chart .domain, .ecg-chart .tick line { stroke: var(--cds-chart-axis); }
+  .ecg-tip { position: absolute; pointer-events: none; padding: 6px 10px; border-radius: 6px; background: var(--cds-surface-popover); border: 1px solid var(--cds-border); box-shadow: var(--cds-shadow-popover); font-size: var(--cds-font-size-caption); white-space: nowrap; z-index: 2; }
+  .ecg-tip b { font-weight: var(--cds-font-weight-medium); }
+  .ecg-tip span { color: var(--cds-text-secondary); }
+  .ecg-two { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: var(--cds-gap-xl); }
+  .ecg-msg { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); padding: var(--cds-pad-lg) 0; }
+  .ecg-stat { font-family: var(--font-anthropic-serif); font-size: 1.15em; font-variant-numeric: tabular-nums; }
+  .ecg-tablewrap { overflow-x: auto; }
+  .ecg-table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  .ecg-table th, .ecg-table td { padding: 8px 12px; text-align: right; border-bottom: 1px solid var(--color-border-line); white-space: nowrap; }
+  .ecg-table th:first-child, .ecg-table td:first-child, #method-table th:nth-child(2), #method-table td:nth-child(2) { text-align: left; }
+  .ecg-table th { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); font-weight: var(--cds-font-weight-medium); }
+  .ecg-table td.hit { font-weight: var(--cds-font-weight-medium); color: var(--color-ok); }
+  .ecg-table td.miss { color: var(--color-bad); }
+  .ecg-steps { margin: 0; padding-left: 1.4em; display: flex; flex-direction: column; gap: 6px; max-width: 72ch; line-height: 1.5; }
+  .ecg-steps b { font-weight: var(--cds-font-weight-medium); }
+  .ecg-foot { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); max-width: 72ch; line-height: 1.5; margin: 0; }
+
+  .ecg-byline { margin: 0; font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+  .ecg-byline a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+  .ecg-try { margin: 0; padding: var(--cds-pad-md) var(--cds-pad-lg); border-radius: var(--cds-radius); border: 1px dashed var(--color-border-line); font-size: var(--cds-font-size-body); line-height: 1.5; max-width: 80ch; }
+  .ecg-try b { font-weight: var(--cds-font-weight-medium); }
+  .ecg-try a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+  .ecg-controls { display: flex; flex-wrap: wrap; gap: var(--cds-gap-md) var(--cds-gap-xl); align-items: center; }
+  .ecg [hidden] { display: none !important; }
+  .ecg-explain { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--cds-gap-xl); padding: var(--cds-pad-lg); border-radius: var(--cds-radius); border: 1px solid var(--color-border-line); background: var(--color-panel); }
+  .ecg-explain[hidden], .ecg-lang[hidden] { display: none; }
+  .ecg-explain h3 { margin: 0 0 6px; font-size: var(--cds-font-size-body); font-weight: var(--cds-font-weight-medium); }
+  .ecg-explain p { margin: 0 0 var(--cds-gap-sm); line-height: 1.6; max-width: 60ch; }
+  .ecg-big { font-size: var(--cds-font-size-heading); line-height: 1.5; }
+  .ecg-urgent { color: var(--color-bad); font-weight: var(--cds-font-weight-medium); }
+  .ecg-lang { display: contents; }
+  .ecg-tune { display: grid; grid-template-columns: minmax(240px, 1fr) minmax(280px, 1.3fr); gap: var(--cds-gap-xl); align-items: start; }
+  @media (max-width: 700px) { .ecg-tune { grid-template-columns: 1fr; } }
+  .ecg-sliders { display: flex; flex-direction: column; gap: var(--cds-gap-lg); }
+  .ecg-slider label { display: flex; justify-content: space-between; font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); margin-bottom: 4px; }
+  .ecg-slider output { font-variant-numeric: tabular-nums; color: var(--color-fg); font-weight: var(--cds-font-weight-medium); }
+  .ecg-slider input[type=range] { width: 100%; accent-color: var(--color-fg); }
+  .ecg-result { display: grid; grid-template-columns: 1fr 1fr; gap: var(--cds-gap-md); }
+  .ecg-result .ecg-tile-value.good { color: var(--color-ok); }
+  .ecg-result .ecg-tile-value.bad { color: var(--color-bad); }
+  .ecg-pm { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: var(--cds-gap-md); }
+  .ecg-pm .ecg-tile p, .ecg-pm .ecg-tile ul { margin: 0; line-height: 1.55; }
+  .ecg-pm .ecg-tile ul { padding-left: 1.1em; }
+  .ecg-pm h3 { margin: 0; font-size: var(--cds-font-size-body); font-weight: var(--cds-font-weight-medium); }
+  [data-dash-source-state=refreshing] { opacity: .5; }
+  @media (max-width: 520px) { .ecg-verdict { grid-template-columns: 1fr; } }
+</style>
+
+<div class="ecg">
+  <header class="ecg-head" id="intro">
+    <p class="ecg-eyebrow">ECG Report Explainer &middot; working prototype</p>
+    <h1 class="ecg-title">An ECG strip, explained in plain words</h1>
+    <p class="ecg-lede">Most patients get an ECG printout that only says "normal" or "abnormal". This prototype reads the heartbeat signal itself, finds every beat, flags the ones that arrive early or look unusual, and says what that means in everyday language. It builds on our paper, <a href="https://ouci.dntb.gov.ua/works/4Lyyxzwl" target="_blank" rel="noopener">A Comprehensive Survey on ECG Signal Graph Interpretation</a> (2022), and runs on real recordings from the public MIT-BIH Arrhythmia Database, tested across 44 patients.</p>
+    <p class="ecg-byline">Built by <span>Harshitha A Reddy</span> · <a href="https://github.com/harshithaareddy8201/ecg-read-dashboard" target="_blank" rel="noopener">Code on GitHub</a></p>
+  </header>
+
+  <p class="ecg-try" id="try-it"><b>Try it:</b> switch between the two recordings, flip between the patient and doctor views, read the patient view in Hindi or Kannada, pick a flagged beat on the ECG trace, and drag the sliders in "Tuning the alarm" to see the trade-off between catching problems and raising false alarms. Prefer a guided tour? <a href="story.html" target="_blank" rel="noopener">Read the story version</a>.</p>
+
+  <div class="ecg-controls" id="controls">
+  <div class="ecg-picker" role="group" aria-label="Choose a recording" id="picker">
+    <span class="ecg-picker-label">Recording</span>
+    <button type="button" class="ecg-tab" data-record="100" aria-pressed="true">Record 100</button>
+    <button type="button" class="ecg-tab" data-record="208" aria-pressed="false">Record 208</button>
+    <span class="ecg-recnote" data-draw="kpi" data-source="recordings" data-field="description">—</span>
+  </div>
+  <div class="ecg-picker" role="group" aria-label="Choose a view" id="view-picker">
+    <span class="ecg-picker-label">View</span>
+    <button type="button" class="ecg-tab" data-set-view="patient" aria-pressed="true">Patient</button>
+    <button type="button" class="ecg-tab" data-set-view="doctor" aria-pressed="false">Doctor</button>
+  </div>
+  <div class="ecg-picker" role="group" aria-label="Choose a language" id="lang-picker" data-view="patient">
+    <span class="ecg-picker-label">Language</span>
+    <button type="button" class="ecg-tab" data-set-lang="en" aria-pressed="true">English</button>
+    <button type="button" class="ecg-tab" data-set-lang="hi" aria-pressed="false" lang="hi">हिन्दी</button>
+    <button type="button" class="ecg-tab" data-set-lang="kn" aria-pressed="false" lang="kn">ಕನ್ನಡ</button>
+  </div>
+  </div>
+
+  <section class="ecg-verdict" id="verdict" aria-live="polite">
+    <div>
+      <span class="ecg-pill" data-v="green" data-lang="en">Looks regular</span>
+      <span class="ecg-pill" data-v="amber" data-lang="en" hidden>Worth a check-up</span>
+      <span class="ecg-pill" data-v="red" data-lang="en" hidden>See a doctor soon</span>
+      <span class="ecg-pill" data-v="green" data-lang="hi" lang="hi" hidden>सामान्य लगता है</span>
+      <span class="ecg-pill" data-v="amber" data-lang="hi" lang="hi" hidden>जाँच करवाना अच्छा रहेगा</span>
+      <span class="ecg-pill" data-v="red" data-lang="hi" lang="hi" hidden>जल्द डॉक्टर से मिलें</span>
+      <span class="ecg-pill" data-v="green" data-lang="kn" lang="kn" hidden>ಸಾಮಾನ್ಯವಾಗಿ ಕಾಣುತ್ತದೆ</span>
+      <span class="ecg-pill" data-v="amber" data-lang="kn" lang="kn" hidden>ತಪಾಸಣೆ ಮಾಡಿಸುವುದು ಒಳ್ಳೆಯದು</span>
+      <span class="ecg-pill" data-v="red" data-lang="kn" lang="kn" hidden>ಶೀಘ್ರದಲ್ಲೇ ವೈದ್ಯರನ್ನು ಭೇಟಿ ಮಾಡಿ</span>
+      <i data-draw="verdict" data-source="recordings" data-field="verdict"></i>
+    </div>
+    <div>
+      <p class="ecg-advice" data-v="green" data-lang="en">Looks regular. Heart rate is in the usual range and extra beats are rare.</p>
+      <p class="ecg-advice" data-v="amber" data-lang="en" hidden>Mention this at your next check-up. Some extra beats were seen; they are often harmless but worth a doctor's look.</p>
+      <p class="ecg-advice" data-v="red" data-lang="en" hidden>See a doctor soon. The rhythm shows frequent irregular beats or a heart rate outside the usual range.</p>
+      <p class="ecg-advice" data-v="green" data-lang="hi" lang="hi" hidden>धड़कन नियमित लगती है। हृदय गति सामान्य सीमा में है और अतिरिक्त धड़कनें बहुत कम हैं।</p>
+      <p class="ecg-advice" data-v="amber" data-lang="hi" lang="hi" hidden>अगली जाँच में डॉक्टर को यह ज़रूर बताएँ। कुछ अतिरिक्त धड़कनें दिखीं; ये अक्सर हानिरहित होती हैं, पर डॉक्टर का देखना अच्छा है।</p>
+      <p class="ecg-advice" data-v="red" data-lang="hi" lang="hi" hidden>जल्द डॉक्टर से मिलें। धड़कन में बार-बार अनियमितता है या हृदय गति सामान्य सीमा से बाहर है।</p>
+      <p class="ecg-advice" data-v="green" data-lang="kn" lang="kn" hidden>ಬಡಿತ ನಿಯಮಿತವಾಗಿ ಕಾಣುತ್ತದೆ. ಹೃದಯ ಬಡಿತದ ದರ ಸಾಮಾನ್ಯ ಮಿತಿಯಲ್ಲಿದೆ ಮತ್ತು ಹೆಚ್ಚುವರಿ ಬಡಿತಗಳು ಅಪರೂಪ.</p>
+      <p class="ecg-advice" data-v="amber" data-lang="kn" lang="kn" hidden>ಮುಂದಿನ ತಪಾಸಣೆಯಲ್ಲಿ ವೈದ್ಯರಿಗೆ ಇದನ್ನು ತಿಳಿಸಿ. ಕೆಲವು ಹೆಚ್ಚುವರಿ ಬಡಿತಗಳು ಕಂಡುಬಂದಿವೆ; ಅವು ಸಾಮಾನ್ಯವಾಗಿ ಹಾನಿಕರವಲ್ಲ, ಆದರೂ ವೈದ್ಯರು ನೋಡುವುದು ಒಳ್ಳೆಯದು.</p>
+      <p class="ecg-advice" data-v="red" data-lang="kn" lang="kn" hidden>ಶೀಘ್ರದಲ್ಲೇ ವೈದ್ಯರನ್ನು ಭೇಟಿ ಮಾಡಿ. ಬಡಿತದಲ್ಲಿ ಪದೇ ಪದೇ ಅನಿಯಮಿತತೆ ಇದೆ ಅಥವಾ ಹೃದಯ ಬಡಿತದ ದರ ಸಾಮಾನ್ಯ ಮಿತಿಯ ಹೊರಗಿದೆ.</p>
+      <p class="ecg-disclaimer">A screening explainer built for a portfolio, not a medical diagnosis.</p>
+    </div>
+  </section>
+
+  <section class="ecg-explain" id="patient-view" data-view="patient" aria-label="What this means for the patient">
+    <div class="ecg-lang" data-lang="en" lang="en">
+      <div>
+        <h3>What your ECG says</h3>
+        <p class="ecg-big">Your heart beat about <b data-draw="kpi" data-source="recordings" data-field="hr_avg">—</b> times a minute. <b data-draw="kpi" data-source="recordings" data-field="burden_pct">—</b>% of beats were out of rhythm.</p>
+        <h3>What is an extra beat?</h3>
+        <p>Sometimes the heart fires a beat a little early. Most people have a few of these and never feel them. They matter when there are many of them, or when you also feel unwell.</p>
+      </div>
+      <div>
+        <h3>What to do next</h3>
+        <p data-v="green">No action needed. Keep up your usual check-ups.</p>
+        <p data-v="amber" hidden>Show this report at your next check-up. Note down any time you feel fluttering or skipped beats.</p>
+        <p data-v="red" hidden>Book a doctor's appointment in the next few days and take this report with you.</p>
+        <p class="ecg-urgent">Get emergency help now if you have chest pain, fainting or severe breathlessness.</p>
+      </div>
+    </div>
+    <div class="ecg-lang" data-lang="hi" lang="hi" hidden>
+      <div>
+        <h3>आपकी ECG क्या बताती है</h3>
+        <p class="ecg-big">आपका दिल लगभग <b data-draw="kpi" data-source="recordings" data-field="hr_avg">—</b> बार प्रति मिनट धड़का। <b data-draw="kpi" data-source="recordings" data-field="burden_pct">—</b>% धड़कनें लय से बाहर थीं।</p>
+        <h3>अतिरिक्त धड़कन क्या है?</h3>
+        <p>कभी-कभी दिल एक धड़कन थोड़ा पहले कर देता है। ज़्यादातर लोगों में ऐसी कुछ धड़कनें होती हैं और उन्हें पता भी नहीं चलता। ये तब मायने रखती हैं जब ये बहुत ज़्यादा हों, या साथ में आपकी तबीयत ठीक न लगे।</p>
+      </div>
+      <div>
+        <h3>आगे क्या करें</h3>
+        <p data-v="green">कुछ करने की ज़रूरत नहीं। अपनी नियमित जाँच करवाते रहें।</p>
+        <p data-v="amber" hidden>अगली जाँच में यह रिपोर्ट डॉक्टर को दिखाएँ। जब भी धड़कन फड़फड़ाती या रुकती महसूस हो, उसे लिख लें।</p>
+        <p data-v="red" hidden>अगले कुछ दिनों में डॉक्टर से मिलने का समय लें और यह रिपोर्ट साथ ले जाएँ।</p>
+        <p class="ecg-urgent">अगर सीने में दर्द, बेहोशी या साँस लेने में बहुत तकलीफ़ हो, तो तुरंत आपातकालीन मदद लें।</p>
+      </div>
+    </div>
+    <div class="ecg-lang" data-lang="kn" lang="kn" hidden>
+      <div>
+        <h3>ನಿಮ್ಮ ಇಸಿಜಿ ಏನು ಹೇಳುತ್ತದೆ</h3>
+        <p class="ecg-big">ನಿಮ್ಮ ಹೃದಯ ನಿಮಿಷಕ್ಕೆ ಸುಮಾರು <b data-draw="kpi" data-source="recordings" data-field="hr_avg">—</b> ಬಾರಿ ಬಡಿದಿದೆ. <b data-draw="kpi" data-source="recordings" data-field="burden_pct">—</b>% ಬಡಿತಗಳು ಲಯ ತಪ್ಪಿದ್ದವು.</p>
+        <h3>ಹೆಚ್ಚುವರಿ ಬಡಿತ ಎಂದರೇನು?</h3>
+        <p>ಕೆಲವೊಮ್ಮೆ ಹೃದಯ ಒಂದು ಬಡಿತವನ್ನು ಸ್ವಲ್ಪ ಬೇಗ ಮಾಡುತ್ತದೆ. ಹೆಚ್ಚಿನ ಜನರಿಗೆ ಇಂತಹ ಕೆಲವು ಬಡಿತಗಳು ಇರುತ್ತವೆ ಮತ್ತು ಅವರಿಗೆ ಗೊತ್ತೂ ಆಗುವುದಿಲ್ಲ. ಅವು ತುಂಬಾ ಹೆಚ್ಚಾಗಿದ್ದರೆ ಅಥವಾ ನಿಮಗೆ ಅಸ್ವಸ್ಥತೆ ಅನಿಸಿದರೆ ಮಾತ್ರ ಮುಖ್ಯವಾಗುತ್ತವೆ.</p>
+      </div>
+      <div>
+        <h3>ಮುಂದೆ ಏನು ಮಾಡಬೇಕು</h3>
+        <p data-v="green">ಯಾವುದೇ ಕ್ರಮ ಬೇಕಿಲ್ಲ. ನಿಮ್ಮ ನಿಯಮಿತ ತಪಾಸಣೆಗಳನ್ನು ಮುಂದುವರಿಸಿ.</p>
+        <p data-v="amber" hidden>ಮುಂದಿನ ತಪಾಸಣೆಯಲ್ಲಿ ಈ ವರದಿಯನ್ನು ವೈದ್ಯರಿಗೆ ತೋರಿಸಿ. ಹೃದಯ ಬಡಿತ ತಪ್ಪಿದಂತೆ ಅಥವಾ ಅದುರಿದಂತೆ ಅನಿಸಿದಾಗ ಅದನ್ನು ಬರೆದಿಟ್ಟುಕೊಳ್ಳಿ.</p>
+        <p data-v="red" hidden>ಮುಂದಿನ ಕೆಲವು ದಿನಗಳಲ್ಲಿ ವೈದ್ಯರ ಭೇಟಿಗೆ ಸಮಯ ಪಡೆಯಿರಿ ಮತ್ತು ಈ ವರದಿಯನ್ನು ಜೊತೆಗೆ ತೆಗೆದುಕೊಂಡು ಹೋಗಿ.</p>
+        <p class="ecg-urgent">ಎದೆ ನೋವು, ಮೂರ್ಛೆ ಅಥವಾ ತೀವ್ರ ಉಸಿರಾಟದ ತೊಂದರೆ ಇದ್ದರೆ ತಕ್ಷಣ ತುರ್ತು ಸಹಾಯ ಪಡೆಯಿರಿ.</p>
+      </div>
+    </div>
+  </section>
+
+  <div class="ecg-tiles" id="vitals" data-view="doctor" hidden>
+    <div class="ecg-tile" id="tile-hr">
+      <span class="ecg-tile-label">Typical heart rate</span>
+      <span class="ecg-tile-value"><span data-draw="kpi" data-source="recordings" data-field="hr_avg">—</span><span class="ecg-unit">bpm</span></span>
+      <span class="ecg-tile-note">Resting adults usually sit at 60&ndash;100</span>
+    </div>
+    <div class="ecg-tile" id="tile-range">
+      <span class="ecg-tile-label">Usual range</span>
+      <span class="ecg-tile-value"><span data-draw="kpi" data-source="recordings" data-field="hr_min">—</span>&ndash;<span data-draw="kpi" data-source="recordings" data-field="hr_max">—</span><span class="ecg-unit">bpm</span></span>
+      <span class="ecg-tile-note">Lowest and highest, ignoring the extreme 2% each side</span>
+    </div>
+    <div class="ecg-tile" id="tile-burden">
+      <span class="ecg-tile-label">Irregular beats</span>
+      <span class="ecg-tile-value"><span data-draw="kpi" data-source="recordings" data-field="burden_pct">—</span><span class="ecg-unit">%</span></span>
+      <span class="ecg-tile-note">Share of all beats flagged as early or unusual</span>
+    </div>
+    <div class="ecg-tile" id="tile-early">
+      <span class="ecg-tile-label">Early beats</span>
+      <span class="ecg-tile-value" data-draw="kpi" data-source="recordings" data-field="early">—</span>
+      <span class="ecg-tile-note">Normal shape, but arrived too soon</span>
+    </div>
+    <div class="ecg-tile" id="tile-unusual">
+      <span class="ecg-tile-label">Unusual-shape beats</span>
+      <span class="ecg-tile-value" data-draw="kpi" data-source="recordings" data-field="unusual">—</span>
+      <span class="ecg-tile-note">Shape differs from this heart's usual beat</span>
+    </div>
+    <div class="ecg-tile" id="tile-length">
+      <span class="ecg-tile-label">Beats analysed</span>
+      <span class="ecg-tile-value" data-draw="kpi" data-source="recordings" data-field="beats">—</span>
+      <span class="ecg-tile-note">Over <span data-draw="kpi" data-source="recordings" data-field="duration_min">—</span> minutes of recording</span>
+    </div>
+  </div>
+
+  <section class="ecg-section" id="strip">
+    <div class="ecg-row">
+      <h2 class="ecg-h2">The heartbeat trace, on ECG paper</h2>
+      <select class="dash-select" id="strip-select" data-draw="strip-select" aria-label="Choose a 10-second strip" data-source="strip_index"></select>
+    </div>
+    <p class="ecg-sub">Ten seconds of the lead II signal. Each small square is 0.04 s by 0.1 mV and each large square is 0.2 s by 0.5 mV, as on a hospital printout. Pick a flagged beat to jump to it.</p>
+    <div class="ecg-legend" aria-hidden="true">
+      <span class="ecg-key"><i class="ecg-dot n"></i>Normal beat</span>
+      <span class="ecg-key"><i class="ecg-dot e"></i>Early beat</span>
+      <span class="ecg-key"><i class="ecg-dot u"></i>Unusual shape</span>
+    </div>
+    <div class="ecg-chart" id="ecg-chart" data-draw="ecg" data-source="strips beats strip_index"></div>
+  </section>
+
+  <div class="ecg-two" id="doctor-charts" data-view="doctor" hidden>
+    <section class="ecg-section" id="rhythm">
+      <h2 class="ecg-h2">Rhythm map: one dot per beat</h2>
+      <p class="ecg-sub">Across is the gap before a beat, up is the gap after it. A steady rhythm makes one tight cluster on the diagonal. An early beat lands left of it, then a pause pushes it up. The rare very long gaps are pinned to the chart edge.</p>
+      <div class="ecg-chart" id="poincare-chart" data-draw="poincare" data-source="beats"></div>
+    </section>
+    <section class="ecg-section" id="trend">
+      <h2 class="ecg-h2">Heart rate, minute by minute</h2>
+      <p class="ecg-sub">Median beats per minute in each minute of the recording.</p>
+      <div class="ecg-chart" id="hr-chart" data-draw="hr" data-source="hr_trend"></div>
+    </section>
+  </div>
+
+  <section class="ecg-section" id="tuning">
+    <h2 class="ecg-h2">Tuning the alarm: catching problems vs false alarms</h2>
+    <p class="ecg-sub">Every screening tool has to choose how sensitive to be. Move the sliders to change the two rule thresholds and see what Record 100's cardiologist labels say would happen. The rest of the page uses the defaults, 0.85 and 0.80.</p>
+    <div class="ecg-tune">
+      <div class="ecg-sliders">
+        <div class="ecg-slider">
+          <label for="early-t">Early beat: gap shorter than this share of the usual gap <output id="early-out">0.85</output></label>
+          <input type="range" id="early-t" min="0" max="4" step="1" value="2" aria-describedby="early-help">
+          <span class="ecg-tile-note" id="early-help">Higher flags more beats as early.</span>
+        </div>
+        <div class="ecg-slider">
+          <label for="shape-t">Unusual shape: match to usual beat below <output id="shape-out">0.80</output></label>
+          <input type="range" id="shape-t" min="0" max="7" step="1" value="4" aria-describedby="shape-help">
+          <span class="ecg-tile-note" id="shape-help">Higher flags more beats as unusual.</span>
+        </div>
+        <div class="ecg-result">
+          <div class="ecg-tile">
+            <span class="ecg-tile-label">Problem beats caught</span>
+            <span class="ecg-tile-value"><span data-draw="sweep" data-source="threshold_sweep" data-field="abnormal_caught">—</span><span class="ecg-unit">&nbsp;of <span data-draw="sweep" data-source="threshold_sweep" data-field="abnormal_beats">—</span></span></span>
+            <span class="ecg-tile-note">Record 100, cardiologist-labelled</span>
+          </div>
+          <div class="ecg-tile">
+            <span class="ecg-tile-label">False alarms</span>
+            <span class="ecg-tile-value"><span data-draw="sweep" data-source="threshold_sweep" data-field="false_alarms">—</span><span class="ecg-unit">&nbsp;of <span data-draw="sweep" data-source="threshold_sweep" data-field="normal_beats">—</span></span></span>
+            <span class="ecg-tile-note">Normal beats wrongly flagged</span>
+          </div>
+        </div>
+        <p class="ecg-tile-note">On Record 208 these settings would flag <b data-draw="sweep208" data-source="threshold_sweep" data-field="flagged_pct">—</b>% of beats.</p>
+      </div>
+      <div>
+        <div class="ecg-chart" id="tradeoff-chart" data-draw="tradeoff" data-source="threshold_sweep"></div>
+        <p class="ecg-tile-note">Each dot is one early-beat setting, at the chosen shape setting. Up is better; right is worse. The ringed dot is your current choice.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="ecg-section" id="benchmark">
+    <h2 class="ecg-h2">Tested on 44 patients: what holds up and what doesn't</h2>
+    <p class="ecg-sub">The full MIT-BIH database has 48 recordings; the 4 from pacemaker patients are left out, as is standard. Across the other <b class="ecg-stat" data-draw="cell" data-source="benchmark_totals" data-field="value" data-where="metric=records">—</b> patients the beat finder caught <b class="ecg-stat" data-draw="cell" data-source="benchmark_totals" data-field="value" data-where="metric=detection_pct">—</b>% of <b class="ecg-stat" data-draw="cell" data-source="benchmark_totals" data-field="value" data-where="metric=labelled_beats">—</b> labelled beats, and <b class="ecg-stat" data-draw="cell" data-source="benchmark_totals" data-field="value" data-where="metric=precision_pct">—</b>% of what it found were real beats.</p>
+    <p class="ecg-sub">To keep the test fair, the trained model learned from 22 patients and was scored on 22 different ones it had never seen. The simple rules were scored on the same 22.</p>
+    <div class="ecg-tablewrap">
+      <table class="ecg-table" id="method-table" data-source="method_comparison" data-row-key="method,beat_type">
+        <thead>
+          <tr>
+            <th data-field="method">Method</th>
+            <th data-field="beat_type">Beat type</th>
+            <th data-field="true_beats">Real beats</th>
+            <th data-field="sensitivity_pct">Caught (%)</th>
+            <th data-field="precision_pct">Flags that were right (%)</th>
+            <th data-field="false_alarms">False alarms</th>
+          </tr>
+        </thead>
+        <tbody data-draw="method-rows"></tbody>
+      </table>
+    </div>
+    <div class="ecg-pm">
+      <div class="ecg-tile"><h3>What holds up</h3><p>Ventricular beats, the more serious kind. The model catches <b data-draw="cell" data-source="method_comparison" data-field="sensitivity_pct" data-where="method=Trained model&amp;beat_type=Ventricular premature">—</b>% and cuts false alarms from <b data-draw="cell" data-source="method_comparison" data-field="false_alarms" data-where="method=Simple rules&amp;beat_type=Ventricular premature">—</b> to <b data-draw="cell" data-source="method_comparison" data-field="false_alarms" data-where="method=Trained model&amp;beat_type=Ventricular premature">—</b>.</p></div>
+      <div class="ecg-tile"><h3>What doesn't</h3><p>Atrial beats. The rules that caught every early beat in Record 100 catch only <b data-draw="cell" data-source="method_comparison" data-field="sensitivity_pct" data-where="method=Simple rules&amp;beat_type=Atrial / supraventricular premature">—</b>% across unseen patients, and the model <b data-draw="cell" data-source="method_comparison" data-field="sensitivity_pct" data-where="method=Trained model&amp;beat_type=Atrial / supraventricular premature">—</b>%.</p></div>
+      <div class="ecg-tile"><h3>What I learned</h3><p>One good-looking recording can mislead. Testing on unseen patients changed the roadmap: better atrial-beat detection moved to the top.</p></div>
+    </div>
+    <h3 class="ecg-h2">Beats found, patient by patient</h3>
+    <p class="ecg-sub">Each dot is one recording. Most sit near 100%; the low ones are mostly records with long stretches of noise or flutter.</p>
+    <div class="ecg-chart" id="records-chart" data-draw="records" data-source="all_records"></div>
+  </section>
+
+  <section class="ecg-section" id="accuracy">
+    <h2 class="ecg-h2">Close-up: Record 100, beat by beat</h2>
+    <p class="ecg-sub">Cardiologists labelled every beat in Record 100. The prototype found <b class="ecg-stat" data-draw="metric" data-source="detection" data-field="value" data-where="metric=sensitivity_pct">—</b>% of the <b class="ecg-stat" data-draw="metric" data-source="detection" data-field="value" data-where="metric=reference_beats">—</b> labelled beats, and <b class="ecg-stat" data-draw="metric" data-source="detection" data-field="value" data-where="metric=precision_pct">—</b>% of the beats it found were real. Record 208 has no labels in this build, so its flags are not yet verified.</p>
+    <div class="ecg-tablewrap">
+      <table class="ecg-table" id="accuracy-table" data-source="accuracy_by_class" data-row-key="cardiologist_label">
+        <thead>
+          <tr>
+            <th data-field="cardiologist_label">Cardiologist label</th>
+            <th data-field="beats">Beats</th>
+            <th data-field="rated_normal">Prototype: normal</th>
+            <th data-field="flagged_early">Prototype: early</th>
+            <th data-field="flagged_unusual">Prototype: unusual</th>
+            <th data-field="missed">Not detected</th>
+          </tr>
+        </thead>
+        <tbody data-draw="acc-rows"></tbody>
+      </table>
+    </div>
+    <p class="ecg-foot">Green cells are where the prototype agreed with the cardiologists. All 33 atrial premature beats were flagged as early with no false alarms on normal beats. The one ventricular premature beat in this record was not detected at all, which is the clearest gap to fix next.</p>
+  </section>
+
+  <section class="ecg-section" id="product">
+    <h2 class="ecg-h2">Product thinking</h2>
+    <p class="ecg-sub">How I would take this from prototype to product.</p>
+    <div class="ecg-pm">
+      <div class="ecg-tile"><h3>Who it's for</h3><p>People who receive an ECG printout but can't see a cardiologist quickly, especially outside big cities, and the general physicians who see them first.</p></div>
+      <div class="ecg-tile"><h3>The problem</h3><p>A label like "abnormal" tells people nothing about what to do. They either panic and queue at a hospital, or ignore it.</p></div>
+      <div class="ecg-tile"><h3>North Star metric</h3><p>Share of users who correctly say what they will do next after reading their result. Proposed target: 80% in a comprehension test.</p></div>
+      <div class="ecg-tile"><h3>Guardrails</h3><ul><li>Dangerous beats missed: aim for none</li><li>False-alarm rate on normal recordings</li><li>Time to understand the result: under 30 seconds</li></ul></div>
+      <div class="ecg-tile"><h3>Key trade-off</h3><p>A miss is worse than a false alarm, but too many alarms erode trust and flood clinics. The tuning section shows where the line sits today.</p></div>
+      <div class="ecg-tile"><h3>Roadmap</h3><ul><li><b>Now:</b> prototype tested on 44 patients; a model that catches ventricular beats with few false alarms</li><li><b>Next:</b> fix atrial-beat detection (P-wave features, a second ECG lead); test the wording with 10 patients in Hindi and Kannada</li><li><b>Later:</b> read a phone photo of a paper ECG; share the summary with a doctor; clinical validation partner</li></ul></div>
+    </div>
+  </section>
+
+  <section class="ecg-section" id="method">
+    <h2 class="ecg-h2">How it works</h2>
+    <ol class="ecg-steps">
+      <li><b>Clean the signal.</b> Filter out baseline wander and electrical noise from the raw lead II trace (360 samples a second).</li>
+      <li><b>Find each heartbeat.</b> Detect the R-peak, the tall spike of every beat, with the NeuroKit2 peak detector.</li>
+      <li><b>Flag early beats.</b> A beat is early when the gap before it is under 85% of the median of the previous 8 gaps.</li>
+      <li><b>Flag unusual shapes.</b> Compare every beat with this person's median beat; a shape match under 0.80 counts as unusual.</li>
+      <li><b>Train a model.</b> A random forest learns from the timing and shape of each beat. It trained on 22 patients and was tested on 22 others it had never seen.</li>
+      <li><b>Explain the result.</b> Turn heart rate and the share of irregular beats into a green, amber or red message a patient can act on.</li>
+    </ol>
+    <p class="ecg-foot">Limits: one ECG lead, a research dataset recorded decades ago, and weak atrial-beat detection, so this shows the idea rather than a clinical tool. The patient and doctor views above use the simple rules; the model is compared in the 44-patient section. Data: Moody and Mark, MIT-BIH Arrhythmia Database, PhysioNet; the Record 208 excerpt is the copy distributed with SciPy.</p>
+  </section>
+</div>
+
+<script>
+  const EARLY = [0.75, 0.8, 0.85, 0.9, 0.95], SHAPE = [0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95];
+  window.ecgEARLY = EARLY; window.ecgSHAPE = SHAPE;
+  const P = () => {
+    const p = dash.params(); const record = p.record === '208' ? '208' : '100';
+    const ei = Number.isInteger(+p.early_i) && +p.early_i >= 0 && +p.early_i < EARLY.length ? +p.early_i : 2;
+    const si = Number.isInteger(+p.shape_i) && +p.shape_i >= 0 && +p.shape_i < SHAPE.length ? +p.shape_i : 4;
+    return {record, strip: p.strip && String(p.strip).startsWith(record + '-') ? p.strip : record + '-1',
+            view: p.view === 'doctor' ? 'doctor' : 'patient', lang: ['hi', 'kn'].includes(p.lang) ? p.lang : 'en', ei, si};
+  };
+  window.ecgP = P;
+  const COLORS = {normal: 'var(--cds-chart-muted)', early: 'var(--color-warn)', unusual: 'var(--color-bad)'};
+  window.ecgColors = COLORS;
+  const NAMES = {normal: 'Normal beat', early: 'Early beat', unusual: 'Unusual shape'};
+  window.ecgNames = NAMES;
+
+  document.querySelectorAll('.ecg-tab').forEach((b) => {
+    b.addEventListener('click', () => dash.setParams({record: b.dataset.record, strip: b.dataset.record + '-1'}));
+  });
+  document.querySelectorAll('[data-set-view]').forEach((b) => b.addEventListener('click', () => dash.setParams({view: b.dataset.setView})));
+  document.querySelectorAll('[data-set-lang]').forEach((b) => b.addEventListener('click', () => dash.setParams({lang: b.dataset.setLang})));
+  document.querySelectorAll('#early-t').forEach((r) => r.addEventListener('input', () => dash.setParams({early_i: +r.value})));
+  document.querySelectorAll('#shape-t').forEach((r) => r.addEventListener('input', () => dash.setParams({shape_i: +r.value})));
+  dash.onData(() => {
+    const {record, view, lang, ei, si} = P();
+    document.querySelectorAll('[data-record]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.record === record)));
+    document.querySelectorAll('[data-set-view]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.setView === view)));
+    document.querySelectorAll('[data-set-lang]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.setLang === lang)));
+    const r = dash.data('recordings');
+    const row = r.status === 'ok' ? r.data.find((d) => String(d.record) === record) : null;
+    const v = row ? row.verdict : null;
+    const L = view === 'doctor' ? 'en' : lang;
+    document.querySelectorAll('[data-view]').forEach((el) => { el.hidden = el.dataset.view !== view; });
+    document.querySelectorAll('[data-lang]').forEach((el) => { el.hidden = el.dataset.lang !== L; });
+    document.querySelectorAll('[data-v]').forEach((el) => {
+      const inLang = el.closest('[data-lang]');
+      el.hidden = !v || el.dataset.v !== v || (el.matches('[data-lang]') && el.dataset.lang !== L);
+      if (!el.matches('[data-lang]') && inLang && inLang.dataset.lang !== L) el.hidden = true;
+    });
+    document.querySelectorAll('#early-t').forEach((x) => { if (document.activeElement !== x) x.value = String(ei); });
+    document.querySelectorAll('#shape-t').forEach((x) => { if (document.activeElement !== x) x.value = String(si); });
+    document.querySelectorAll('#early-out').forEach((o) => { o.value = EARLY[ei].toFixed(2); });
+    document.querySelectorAll('#shape-out').forEach((o) => { o.value = SHAPE[si].toFixed(2); });
+  });
+
+  // Placeholder text for a chart that has no data yet
+  window.ecgWait = (el, statuses) => {
+    const bad = statuses.find((s) => s === 'error' || s === 'missing');
+    const msg = document.createElement('div'); msg.className = 'ecg-msg';
+    msg.textContent = bad ? 'Failed to load' : '—';
+    el.replaceChildren(msg);
+  };
+
+  // Single-value marks from the recordings file
+  const fmt = {hr_avg: d3.format('.0f'), hr_min: d3.format('.0f'), hr_max: d3.format('.0f'), burden_pct: d3.format('.2f'), early: d3.format(','), unusual: d3.format(','), beats: d3.format(','), duration_min: d3.format('.1f')};
+  dash.draw('kpi', (el) => {
+    const r = dash.data('recordings'); const {record} = P();
+    el.setAttribute('data-where', 'record=' + record);
+    if (r.status !== 'ok') { el.textContent = '—'; return; }
+    const row = r.data.find((d) => String(d.record) === record);
+    if (!row) { el.textContent = '—'; return; }
+    const f = el.dataset.field; const v = row[f];
+    el.textContent = fmt[f] ? fmt[f](+v) : v;
+  });
+
+  // Verdict pill and card colour
+  dash.draw('verdict', (el) => {
+    const r = dash.data('recordings'); const {record} = P();
+    el.setAttribute('data-where', 'record=' + record);
+    const row = r.status === 'ok' ? r.data.find((d) => String(d.record) === record) : null;
+    const v = row ? row.verdict : 'green';
+    const card = document.getElementById('verdict');
+    if (card) { card.classList.remove('is-green', 'is-amber', 'is-red'); card.classList.add('is-' + v); }
+  });
+
+  dash.draw('metric', (el) => {
+    const m = dash.data('detection');
+    if (m.status !== 'ok') { el.textContent = '—'; return; }
+    const key = (el.getAttribute('data-where') || '').split('=')[1];
+    const row = m.data.find((d) => d.metric === key);
+    el.textContent = row ? (key.endsWith('_pct') ? d3.format('.2~f')(+row.value) : d3.format(',')(+row.value)) : '—';
+  });
+
+  dash.draw('acc-rows', (tb) => {
+    const a = dash.data('accuracy_by_class');
+    if (a.status !== 'ok') { tb.replaceChildren(); return; }
+    const right = {'Normal': 'rated_normal', 'Atrial premature': 'flagged_early', 'Ventricular premature': 'flagged_unusual'};
+    const cols = ['cardiologist_label', 'beats', 'rated_normal', 'flagged_early', 'flagged_unusual', 'missed'];
+    tb.replaceChildren(...a.data.map((r) => {
+      const tr = document.createElement('tr'); tr.setAttribute('data-key', r.cardiologist_label);
+      cols.forEach((c) => {
+        const td = document.createElement('td');
+        td.textContent = c === 'cardiologist_label' ? r[c] : d3.format(',')(+r[c]);
+        if (c !== 'cardiologist_label' && c !== 'beats' && +r[c] > 0) td.className = c === right[r.cardiologist_label] ? 'hit' : 'miss';
+        tr.appendChild(td);
+      });
+      return tr;
+    }));
+  });
+
+
+  const sweepRow = (record) => {
+    const t = dash.data('threshold_sweep'); if (t.status !== 'ok') return null;
+    const {ei, si} = P(); const e = window.ecgEARLY[ei], sh = window.ecgSHAPE[si];
+    return t.data.find((d) => String(d.record) === record && +d.early_threshold === e && +d.shape_threshold === sh) || null;
+  };
+  window.ecgSweepRow = sweepRow;
+  const whereFor = (row) => 'record=' + row.record + '&early_threshold=' + row.early_threshold + '&shape_threshold=' + row.shape_threshold;
+  dash.draw('sweep', (el) => {
+    const row = sweepRow('100');
+    if (!row) { el.textContent = '—'; return; }
+    el.setAttribute('data-where', whereFor(row));
+    el.textContent = d3.format(',')(+row[el.dataset.field]);
+    const f = el.dataset.field;
+    const tv = el.closest('.ecg-tile-value');
+    if (tv && f === 'abnormal_caught') { tv.classList.toggle('good', +row.abnormal_caught >= +row.abnormal_beats - 1); tv.classList.toggle('bad', +row.abnormal_caught < +row.abnormal_beats - 1); }
+    if (tv && f === 'false_alarms') { tv.classList.toggle('good', +row.false_alarms === 0); tv.classList.toggle('bad', +row.false_alarms > 10); }
+  });
+  dash.draw('sweep208', (el) => {
+    const row = sweepRow('208');
+    if (!row) { el.textContent = '—'; return; }
+    el.setAttribute('data-where', whereFor(row));
+    el.textContent = d3.format('.2f')(+row.flagged_pct);
+  });
+
+  // Generic single cell: data-where may hold several col=value pairs joined by &
+  dash.draw('cell', (el) => {
+    const src = el.dataset.source, f = el.dataset.field, d = dash.data(src);
+    if (d.status !== 'ok') { el.textContent = '—'; return; }
+    const conds = (el.getAttribute('data-where') || '').split('&').filter(Boolean).map((p) => p.split('=').map(decodeURIComponent));
+    const row = d.data.find((r) => conds.every(([k, v]) => String(r[k]) === v));
+    if (!row) { el.textContent = '—'; return; }
+    const v = +row[f];
+    el.textContent = Number.isFinite(v) ? (Number.isInteger(v) ? d3.format(',')(v) : d3.format('.3~f')(v)) : row[f];
+  });
+
+  dash.draw('method-rows', (tb) => {
+    const m = dash.data('method_comparison');
+    if (m.status !== 'ok') { tb.replaceChildren(); return; }
+    const cols = ['method', 'beat_type', 'true_beats', 'sensitivity_pct', 'precision_pct', 'false_alarms'];
+    const rows = m.data.filter((r) => r.beat_type !== 'Normal');
+    tb.replaceChildren(...rows.map((r) => {
+      const tr = document.createElement('tr');
+      const enc = (t) => String(t).replace(/[%&=,]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+      tr.setAttribute('data-key', enc(r.method) + ',' + enc(r.beat_type));
+      cols.forEach((c) => {
+        const td = document.createElement('td');
+        const v = +r[c];
+        td.textContent = (c === 'method' || c === 'beat_type') ? r[c] : (c.endsWith('_pct') ? d3.format('.1f')(v) : d3.format(',')(v));
+        if (c === 'sensitivity_pct') td.className = v >= 80 ? 'hit' : 'miss';
+        tr.appendChild(td);
+      });
+      return tr;
+    }));
+  });
+  dash.draw('strip-select', (sel) => {
+    const s = dash.data('strip_index'); const {record, strip} = P();
+    const rows = s.status === 'ok' ? s.data.filter((d) => String(d.record) === record).sort((a, b) => +a.order - +b.order) : [];
+    sel.replaceChildren(...rows.map((d) => new Option(d.label, d.strip)));
+    if (rows.length) sel.value = strip;
+    sel.onchange = () => dash.setParams({strip: sel.value});
+  });
+</script>
+
+<script>
+  // Shared tooltip helper (lives inside each chart's own drawing)
+  window.ecgTip = (el) => {
+    const tip = document.createElement('div'); tip.className = 'ecg-tip'; tip.hidden = true; el.appendChild(tip);
+    return {
+      show(x, y, title, lines) {
+        const b = document.createElement('b'); b.textContent = title;
+        tip.replaceChildren(b, ...lines.map((l) => { const s = document.createElement('div'); const sp = document.createElement('span'); sp.textContent = l; s.appendChild(sp); return s; }));
+        tip.hidden = false;
+        const w = tip.offsetWidth, W = el.clientWidth;
+        tip.style.left = Math.max(0, Math.min(W - w, x + 12)) + 'px';
+        tip.style.top = Math.max(0, y - tip.offsetHeight - 10) + 'px';
+      },
+      hide() { tip.hidden = true; },
+    };
+  };
+
+  // ECG strip on graph paper
+  dash.draw('ecg', (el) => {
+    const s = dash.data('strips'), b = dash.data('beats'), si = dash.data('strip_index');
+    if ([s, b, si].some((x) => x.status !== 'ok')) { window.ecgWait(el, [s.status, b.status, si.status]); return; }
+    const {record, strip} = window.ecgP();
+    const info = si.data.find((d) => d.strip === strip) || si.data.find((d) => String(d.record) === record);
+    const t0 = +info.start_s;
+    const pts = s.data.filter((d) => d.strip === info.strip).map((d) => ({t: +d.t, mv: +d.mv}));
+    const dur = pts.length ? pts[pts.length - 1].t : 10;
+    const beats = b.data.filter((d) => String(d.record) === record && +d.time_s >= t0 && +d.time_s <= t0 + dur);
+    const W = Math.max(300, el.clientWidth), H = Math.max(200, Math.min(280, W * 0.32)), m = {l: 6, r: 6, t: 26, b: 22};
+    const x = d3.scaleLinear([0, 10], [m.l, W - m.r]);
+    const ext = d3.extent(pts, (d) => d.mv);
+    const lo = Math.floor((ext[0] - 0.2) * 2) / 2, hi = Math.ceil((ext[1] + 0.4) * 2) / 2;
+    const y = d3.scaleLinear([lo, hi], [H - m.b, m.t]);
+    el.replaceChildren();
+    const svg = d3.select(el).append('svg').attr('viewBox', `0 0 ${W} ${H}`).attr('height', H)
+      .attr('role', 'img').attr('aria-label', `ECG trace, Record ${record}, ${info.label}, with ${beats.length} beats marked`);
+    const grid = svg.append('g');
+    const small = x(0.04) - x(0) >= 4;
+    if (small) {
+      d3.range(0, 10.0001, 0.04).forEach((t) => grid.append('line').attr('x1', x(t)).attr('x2', x(t)).attr('y1', y(hi)).attr('y2', y(lo)).style('stroke', 'var(--color-bad)').style('stroke-opacity', 0.1));
+      d3.range(lo, hi + 0.0001, 0.1).forEach((v) => grid.append('line').attr('x1', x(0)).attr('x2', x(10)).attr('y1', y(v)).attr('y2', y(v)).style('stroke', 'var(--color-bad)').style('stroke-opacity', 0.1));
+    }
+    d3.range(0, 10.0001, 0.2).forEach((t) => grid.append('line').attr('x1', x(t)).attr('x2', x(t)).attr('y1', y(hi)).attr('y2', y(lo)).style('stroke', 'var(--color-bad)').style('stroke-opacity', 0.28));
+    d3.range(lo, hi + 0.0001, 0.5).forEach((v) => grid.append('line').attr('x1', x(0)).attr('x2', x(10)).attr('y1', y(v)).attr('y2', y(v)).style('stroke', 'var(--color-bad)').style('stroke-opacity', 0.28));
+    const ax = svg.append('g').attr('transform', `translate(0,${H - m.b})`).call(d3.axisBottom(x).ticks(W < 500 ? 5 : 10).tickFormat((d) => d + ' s').tickSizeOuter(0));
+    ax.select('.domain').remove();
+    svg.append('path').datum(pts).attr('d', d3.line((d) => x(d.t), (d) => y(d.mv))).style('fill', 'none').style('stroke', 'var(--color-fg)').style('stroke-width', 1.4).style('stroke-linejoin', 'round');
+    const tip = window.ecgTip(el);
+    const fmtT = (sec) => { const mm = Math.floor(sec / 60), ss = (sec % 60).toFixed(1).padStart(4, '0'); return `${mm}:${ss}`; };
+    beats.forEach((d) => {
+      const bt = +d.time_s - t0;
+      const near = pts.filter((p) => Math.abs(p.t - bt) < 0.06);
+      const peak = near.length ? d3.max(near, (p) => p.mv) : 0;
+      const cy = Math.max(10, y(peak) - 10);
+      const big = d.label !== 'normal';
+      svg.append('circle').attr('cx', x(bt)).attr('cy', cy).attr('r', big ? 6 : 3.5)
+        .style('fill', window.ecgColors[d.label] || window.ecgColors.normal).style('stroke', 'var(--color-bg)').style('stroke-width', 1.5)
+        .style('cursor', 'pointer')
+        .on('pointerenter', (ev) => tip.show(x(bt), cy, window.ecgNames[d.label] || d.label, [`Beat ${d3.format(',')(+d.beat)} at ${fmtT(+d.time_s)}`, d.rr_ms ? `Gap before it: ${d.rr_ms} ms` : 'First beat']))
+        .on('pointerleave', () => tip.hide());
+    });
+  });
+
+  // Poincare plot: RR(n) vs RR(n+1)
+  dash.draw('poincare', (el) => {
+    const b = dash.data('beats');
+    if (b.status !== 'ok') { window.ecgWait(el, [b.status]); return; }
+    const {record} = window.ecgP();
+    const pts = b.data.filter((d) => String(d.record) === record && d.rr_ms && d.rr_next_ms).map((d) => ({a: +d.rr_ms, b: +d.rr_next_ms, label: d.label, beat: +d.beat}));
+    const W = Math.max(280, el.clientWidth), H = Math.min(360, Math.max(260, W * 0.85)), m = {l: 62, r: 12, t: 10, b: 44};
+    const all = pts.flatMap((p) => [p.a, p.b]);
+    const srt = all.slice().sort(d3.ascending), med = d3.quantile(srt, 0.5);
+    const dom = [Math.floor(d3.quantile(srt, 0.005) / 100) * 100, Math.ceil(Math.min(srt[srt.length - 1], Math.max(d3.quantile(srt, 0.99), 1.6 * med)) / 100) * 100];
+    const x = d3.scaleLinear(dom, [m.l, W - m.r]).clamp(true), y = d3.scaleLinear(dom, [H - m.b, m.t]).clamp(true);
+    el.replaceChildren();
+    const svg = d3.select(el).append('svg').attr('viewBox', `0 0 ${W} ${H}`).attr('height', H).attr('role', 'img')
+      .attr('aria-label', `Rhythm map for Record ${record}: gap before each beat against gap after it, ${pts.length} beats`);
+    svg.append('g').attr('transform', `translate(0,${H - m.b})`).call(d3.axisBottom(x).ticks(5).tickSizeOuter(0));
+    svg.append('g').attr('transform', `translate(${m.l},0)`).call(d3.axisLeft(y).ticks(5).tickSizeOuter(0));
+    svg.append('line').attr('x1', x(dom[0])).attr('y1', y(dom[0])).attr('x2', x(dom[1])).attr('y2', y(dom[1])).style('stroke', 'var(--cds-chart-reference)').style('stroke-dasharray', '4 4');
+    svg.append('text').attr('x', (m.l + W - m.r) / 2).attr('y', H - 8).attr('text-anchor', 'middle').style('fill', 'var(--cds-text-secondary)').style('font-size', 'var(--cds-font-size-caption)').text('Gap before the beat (ms)');
+    svg.append('text').attr('transform', `translate(12,${(m.t + H - m.b) / 2}) rotate(-90)`).attr('text-anchor', 'middle').style('fill', 'var(--cds-text-secondary)').style('font-size', 'var(--cds-font-size-caption)').text('Gap after the beat (ms)');
+    const order = {normal: 0, early: 1, unusual: 2};
+    pts.sort((p, q) => order[p.label] - order[q.label]);
+    svg.append('g').selectAll('circle').data(pts).join('circle').attr('cx', (d) => x(d.a)).attr('cy', (d) => y(d.b)).attr('r', (d) => d.label === 'normal' ? 2.2 : 3.5)
+      .style('fill', (d) => window.ecgColors[d.label]).style('fill-opacity', (d) => d.label === 'normal' ? 0.45 : 0.85);
+    const tip = window.ecgTip(el);
+    const del = d3.Delaunay.from(pts, (d) => x(d.a), (d) => y(d.b));
+    svg.append('rect').attr('x', m.l).attr('y', m.t).attr('width', W - m.l - m.r).attr('height', H - m.t - m.b).style('fill', 'transparent')
+      .on('pointermove', (ev) => {
+        const [px, py] = d3.pointer(ev); const i = del.find(px, py); const d = pts[i];
+        if (!d || Math.hypot(x(d.a) - px, y(d.b) - py) > 24) { tip.hide(); return; }
+        tip.show(x(d.a), y(d.b), window.ecgNames[d.label], [`Beat ${d3.format(',')(d.beat)}`, `Gap before ${d.a} ms, after ${d.b} ms`]);
+      })
+      .on('pointerleave', () => tip.hide());
+  });
+
+
+  // Trade-off: false alarms (x) vs problem beats caught (y), one dot per early-beat setting
+  dash.draw('tradeoff', (el) => {
+    const t = dash.data('threshold_sweep');
+    if (t.status !== 'ok') { window.ecgWait(el, [t.status]); return; }
+    const {ei, si} = window.ecgP(); const sh = window.ecgSHAPE[si], cur = window.ecgEARLY[ei];
+    const pts = t.data.filter((d) => String(d.record) === '100' && +d.shape_threshold === sh)
+      .map((d) => ({e: +d.early_threshold, fa: +d.false_alarms, c: +d.abnormal_caught, n: +d.abnormal_beats})).sort((a, b) => a.e - b.e);
+    const W = Math.max(280, el.clientWidth), H = Math.min(300, Math.max(240, W * 0.6)), m = {l: 48, r: 36, t: 30, b: 44};
+    const total = pts.length ? pts[0].n : 34;
+    const x = d3.scaleSymlog().constant(1).domain([0, Math.max(10, d3.max(pts, (d) => d.fa))]).range([m.l, W - m.r]);
+    const y = d3.scaleLinear([0, total], [H - m.b, m.t]);
+    el.replaceChildren();
+    const svg = d3.select(el).append('svg').attr('viewBox', `0 0 ${W} ${H}`).attr('height', H).attr('role', 'img')
+      .attr('aria-label', `Trade-off on Record 100: problem beats caught against false alarms for five early-beat settings`);
+    const yg = svg.append('g').attr('transform', `translate(${m.l},0)`).call(d3.axisLeft(y).ticks(4).tickSize(-(W - m.l - m.r)));
+    yg.select('.domain').remove(); yg.selectAll('.tick line').style('stroke', 'var(--cds-chart-grid)');
+    svg.append('g').attr('transform', `translate(0,${H - m.b})`).call(d3.axisBottom(x).tickValues([0, 1, 10, 100].filter((v) => v <= x.domain()[1])).tickFormat(d3.format(',')).tickSizeOuter(0));
+    svg.append('text').attr('x', (m.l + W - m.r) / 2).attr('y', H - 8).attr('text-anchor', 'middle').style('fill', 'var(--cds-text-secondary)').style('font-size', 'var(--cds-font-size-caption)').text('False alarms (log scale)');
+    svg.append('text').attr('transform', `translate(12,${(m.t + H - m.b) / 2}) rotate(-90)`).attr('text-anchor', 'middle').style('fill', 'var(--cds-text-secondary)').style('font-size', 'var(--cds-font-size-caption)').text('Problem beats caught');
+    svg.append('line').attr('x1', m.l).attr('x2', W - m.r).attr('y1', y(total)).attr('y2', y(total)).style('stroke', 'var(--cds-chart-reference)').style('stroke-dasharray', '4 4');
+    svg.append('path').datum(pts).attr('d', d3.line((d) => x(d.fa), (d) => y(d.c))).style('fill', 'none').style('stroke', 'var(--cds-chart-muted)').style('stroke-width', 1.5);
+    const tip = window.ecgTip(el);
+    svg.append('g').selectAll('circle').data(pts).join('circle').attr('cx', (d) => x(d.fa)).attr('cy', (d) => y(d.c))
+      .attr('r', (d) => d.e === cur ? 7 : 4.5)
+      .style('fill', (d) => d.e === cur ? dash.colors[0] : 'var(--color-bg)').style('stroke', dash.colors[0]).style('stroke-width', 2).style('cursor', 'pointer')
+      .on('pointerenter', (ev, d) => tip.show(x(d.fa), y(d.c), `Early-beat setting ${d.e.toFixed(2)}`, [`Caught ${d.c} of ${d.n} problem beats`, `${d3.format(',')(d.fa)} false alarms`]))
+      .on('pointerleave', () => tip.hide())
+      .on('click', (ev, d) => dash.setParams({early_i: window.ecgEARLY.indexOf(d.e)}));
+    svg.append('g').selectAll('text').data(pts).join('text')
+      .attr('x', (d) => d.c === total ? x(d.fa) : x(d.fa) + 11).attr('y', (d) => d.c === total ? y(d.c) - 12 : y(d.c) + 4)
+      .attr('text-anchor', (d) => d.c === total ? 'middle' : 'start')
+      .style('fill', 'var(--cds-text-secondary)').style('font-size', 'var(--cds-font-size-caption)').text((d) => d.e.toFixed(2));
+  });
+
+  // Detection rate per recording
+  dash.draw('records', (el) => {
+    const a = dash.data('all_records');
+    if (a.status !== 'ok') { window.ecgWait(el, [a.status]); return; }
+    const pts = a.data.map((r) => ({rec: String(r.record), v: +r.detection_pct, n: +r.labelled_beats, fd: +r.false_detections, vb: +r.ventricular_beats, sb: +r.atrial_beats, split: r.split}));
+    const W = Math.max(300, el.clientWidth), H = 240, m = {l: 44, r: 12, t: 12, b: 40};
+    const x = d3.scalePoint(pts.map((p) => p.rec), [m.l, W - m.r]).padding(0.5);
+    const lo = Math.floor((d3.min(pts, (p) => p.v) - 3) / 5) * 5;
+    const y = d3.scaleLinear([lo, 100], [H - m.b, m.t]);
+    el.replaceChildren();
+    const svg = d3.select(el).append('svg').attr('viewBox', `0 0 ${W} ${H}`).attr('height', H).attr('role', 'img')
+      .attr('aria-label', `Share of labelled beats found in each of ${pts.length} recordings`);
+    const yg = svg.append('g').attr('transform', `translate(${m.l},0)`).call(d3.axisLeft(y).ticks(5).tickFormat((v) => v + '%').tickSize(-(W - m.l - m.r)));
+    yg.select('.domain').remove(); yg.selectAll('.tick line').style('stroke', 'var(--cds-chart-grid)');
+    svg.append('text').attr('x', (m.l + W - m.r) / 2).attr('y', H - 8).attr('text-anchor', 'middle').style('fill', 'var(--cds-text-secondary)').style('font-size', 'var(--cds-font-size-caption)').text('Recording, in database order');
+    const low = (p) => p.v < 95;
+    svg.append('g').selectAll('circle').data(pts).join('circle').attr('cx', (p) => x(p.rec)).attr('cy', (p) => y(p.v)).attr('r', 4)
+      .style('fill', (p) => low(p) ? 'var(--color-bad)' : dash.colors[0]);
+    svg.append('g').selectAll('text').data(pts.filter(low)).join('text').attr('x', (p) => x(p.rec) + 7).attr('y', (p) => y(p.v) + 4)
+      .style('fill', 'var(--cds-text-secondary)').style('font-size', 'var(--cds-font-size-caption)').text((p) => p.rec);
+    const tip = window.ecgTip(el);
+    svg.append('rect').attr('x', m.l).attr('y', m.t).attr('width', W - m.l - m.r).attr('height', H - m.t - m.b).style('fill', 'transparent')
+      .on('pointermove', (ev) => {
+        const [px] = d3.pointer(ev); const p = pts[d3.leastIndex(pts, (q) => Math.abs(x(q.rec) - px))];
+        tip.show(x(p.rec), y(p.v), `Record ${p.rec}`, [`${d3.format('.2f')(p.v)}% of ${d3.format(',')(p.n)} beats found`, `${d3.format(',')(p.fd)} false detections`, `${p.vb} ventricular, ${p.sb} atrial beats`, p.split === 'test' ? 'Model test patient' : 'Model training patient']);
+      })
+      .on('pointerleave', () => tip.hide());
+  });
+  // Heart rate per minute
+  dash.draw('hr', (el) => {
+    const h = dash.data('hr_trend');
+    if (h.status !== 'ok') { window.ecgWait(el, [h.status]); return; }
+    const {record} = window.ecgP();
+    const pts = h.data.filter((d) => String(d.record) === record).map((d) => ({m: +d.minute, v: +d.bpm}));
+    const W = Math.max(280, el.clientWidth), H = Math.min(360, Math.max(260, W * 0.85)), m = {l: 40, r: 16, t: 14, b: 44};
+    const x = d3.scaleLinear(d3.extent(pts, (d) => d.m), [m.l, W - m.r]);
+    const [a, z] = d3.extent(pts, (d) => d.v);
+    const y = d3.scaleLinear([Math.floor((a - 8) / 10) * 10, Math.ceil((z + 8) / 10) * 10], [H - m.b, m.t]);
+    el.replaceChildren();
+    const svg = d3.select(el).append('svg').attr('viewBox', `0 0 ${W} ${H}`).attr('height', H).attr('role', 'img')
+      .attr('aria-label', `Heart rate per minute for Record ${record}, from ${d3.format('.0f')(a)} to ${d3.format('.0f')(z)} beats per minute`);
+    const yg = svg.append('g').attr('transform', `translate(${m.l},0)`).call(d3.axisLeft(y).ticks(5).tickSize(-(W - m.l - m.r)));
+    yg.select('.domain').remove(); yg.selectAll('.tick line').style('stroke', 'var(--cds-chart-grid)');
+    svg.append('g').attr('transform', `translate(0,${H - m.b})`).call(d3.axisBottom(x).ticks(Math.min(pts.length, 6)).tickFormat(d3.format('d')).tickSizeOuter(0));
+    svg.append('text').attr('x', (m.l + W - m.r) / 2).attr('y', H - 8).attr('text-anchor', 'middle').style('fill', 'var(--cds-text-secondary)').style('font-size', 'var(--cds-font-size-caption)').text('Minute of recording');
+    svg.append('path').datum(pts).attr('d', d3.line((d) => x(d.m), (d) => y(d.v))).style('fill', 'none').style('stroke', dash.colors[0]).style('stroke-width', 2);
+    svg.append('g').selectAll('circle').data(pts).join('circle').attr('cx', (d) => x(d.m)).attr('cy', (d) => y(d.v)).attr('r', 3).style('fill', dash.colors[0]);
+    const tip = window.ecgTip(el);
+    svg.append('rect').attr('x', m.l).attr('y', m.t).attr('width', W - m.l - m.r).attr('height', H - m.t - m.b).style('fill', 'transparent')
+      .on('pointermove', (ev) => {
+        const [px] = d3.pointer(ev); const d = pts[d3.leastIndex(pts, (p) => Math.abs(x(p.m) - px))];
+        tip.show(x(d.m), y(d.v), `Minute ${d.m}`, [`${d3.format('.0f')(d.v)} beats per minute`]);
+      })
+      .on('pointerleave', () => tip.hide());
+  });
+</script>
+
+</main>
+<script>window.__dashBoot();</script>
+</body>
+</html>

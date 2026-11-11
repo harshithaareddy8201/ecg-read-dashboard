@@ -1,0 +1,7 @@
+metric,value
+records,44
+labelled_beats,100733
+beats_found,98942
+false_detections,2438
+detection_pct,98.22
+precision_pct,97.6

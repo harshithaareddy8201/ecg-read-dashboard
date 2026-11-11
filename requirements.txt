@@ -1,0 +1,6 @@
+wfdb
+neurokit2
+scikit-learn
+numpy
+pandas
+pooch

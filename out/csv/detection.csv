@@ -1,0 +1,5 @@
+metric,description,value
+reference_beats,Beats labelled by cardiologists,2273.0
+detected_beats,Beats the prototype found,2270.0
+sensitivity_pct,Share of labelled beats found (%),99.87
+precision_pct,Share of found beats that were real (%),100.0

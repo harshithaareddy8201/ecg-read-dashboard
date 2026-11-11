@@ -1,0 +1,17 @@
+record,strip,order,kind,start_s,label
+100,100-1,1,first,0.0,First 10 seconds
+100,100-2,2,flagged,469.22,Flagged beat at 7:54
+100,100-3,3,flagged,863.96,Flagged beat at 14:28
+100,100-4,4,flagged,1042.45,Flagged beat at 17:27
+100,100-5,5,flagged,1200.11,Flagged beat at 20:05
+100,100-6,6,flagged,1267.69,Flagged beat at 21:12
+100,100-7,7,flagged,1567.94,Flagged beat at 26:12
+100,100-8,8,flagged,1742.7,Flagged beat at 29:07
+208,208-1,1,first,0.0,First 10 seconds
+208,208-2,2,flagged,39.1,Flagged beat at 0:44
+208,208-3,3,flagged,80.93,Flagged beat at 1:25
+208,208-4,4,flagged,120.86,Flagged beat at 2:05
+208,208-5,5,flagged,165.88,Flagged beat at 2:50
+208,208-6,6,flagged,213.54,Flagged beat at 3:38
+208,208-7,7,flagged,252.21,Flagged beat at 4:17
+208,208-8,8,flagged,293.91,Flagged beat at 4:58
